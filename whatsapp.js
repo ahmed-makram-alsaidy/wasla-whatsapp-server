@@ -7,7 +7,6 @@ const {
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  makeInMemoryStore,
   delay,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -19,18 +18,14 @@ const { enqueue } = require('./rateLimiter');
 
 // ── Constants ────────────────────────────────────────────
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
-const SESSION_NAME = process.env.SESSION_NAME || 'wasla_main';
-const logger = pino({ level: 'silent' }); // Baileys internal logs silent
+const logger = pino({ level: 'silent' });
 
 // ── State ─────────────────────────────────────────────────
 let sock = null;
 let currentQr = null;
-let connectionStatus = 'disconnected'; // connecting | connected | disconnected | banned
+let connectionStatus = 'disconnected';
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 5;
-
-// Store يحتفظ بالـ cache في الذاكرة
-const store = makeInMemoryStore({ logger });
 
 /**
  * بدء الاتصال بواتساب
@@ -51,12 +46,10 @@ async function connect() {
     logger,
     printQRInTerminal: true,
     browser: ['واصلة إكسبريس', 'Chrome', '120.0.0'],
-    markOnlineOnConnect: false, // لا نظهر online دايماً (anti-ban)
+    markOnlineOnConnect: false,
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
   });
-
-  store.bind(sock.ev);
 
   // ── Events ─────────────────────────────────────────────
 
