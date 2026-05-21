@@ -2,3 +2,4 @@ auth_info_baileys/
 node_modules/
 .env
 *.log
+npm-debug.log*
