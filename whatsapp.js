@@ -22,10 +22,11 @@ const logger = pino({ level: 'silent' });
 
 // ── State ─────────────────────────────────────────────────
 let sock = null;
-let currentQr = null;
+let currentQrRaw = null;      // الـ QR الخام من Baileys
+let currentQrBase64 = null;   // الـ QR كـ base64 image جاهز للعرض
 let connectionStatus = 'disconnected';
 let reconnectAttempts = 0;
-const MAX_RECONNECT = 5;
+const MAX_RECONNECT = 10;
 
 /**
  * بدء الاتصال بواتساب
@@ -36,15 +37,22 @@ async function connect() {
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+
+  let version;
+  try {
+    const result = await fetchLatestBaileysVersion();
+    version = result.version;
+  } catch (e) {
+    version = [2, 3000, 1023456789];
+  }
 
   console.log(`[WhatsApp] Connecting with Baileys v${version.join('.')}`);
+  connectionStatus = 'connecting';
 
   sock = makeWASocket({
     version,
     auth: state,
     logger,
-    printQRInTerminal: true,
     browser: ['واصلة إكسبريس', 'Chrome', '120.0.0'],
     markOnlineOnConnect: false,
     syncFullHistory: false,
@@ -56,33 +64,42 @@ async function connect() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // QR Code جديد
+    // ── QR Code جديد ──────────────────────────────────────
     if (qr) {
-      currentQr = qr;
+      currentQrRaw = qr;
       connectionStatus = 'connecting';
       console.log('[WhatsApp] QR Code received — scan it!');
 
+      // حوّل لـ base64 واحفظه في الذاكرة فوراً
       try {
-        const qrBase64 = await qrcode.toDataURL(qr, { width: 300 });
-        await saveQrCode(qrBase64);
+        currentQrBase64 = await qrcode.toDataURL(qr, {
+          width: 300,
+          margin: 2,
+          color: { dark: '#000000', light: '#ffffff' },
+        });
+        console.log('[WhatsApp] QR base64 ready, length:', currentQrBase64.length);
+        // حاول تحفظه في Supabase (اختياري)
+        saveQrCode(currentQrBase64).catch(() => {});
       } catch (e) {
-        console.error('[WhatsApp] QR to base64 failed:', e.message);
+        console.error('[WhatsApp] QR generate error:', e.message);
       }
     }
 
-    // اتصل
+    // ── اتصل ──────────────────────────────────────────────
     if (connection === 'open') {
-      currentQr = null;
+      currentQrRaw = null;
+      currentQrBase64 = null;
       connectionStatus = 'connected';
       reconnectAttempts = 0;
       const phoneNumber = sock.user?.id?.split(':')[0] || null;
       console.log(`[WhatsApp] ✅ Connected! Phone: ${phoneNumber}`);
-      await clearQrCode(phoneNumber);
+      clearQrCode(phoneNumber).catch(() => {});
     }
 
-    // انقطع
+    // ── انقطع ─────────────────────────────────────────────
     if (connection === 'close') {
-      currentQr = null;
+      currentQrRaw = null;
+      currentQrBase64 = null;
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut && code !== 401;
 
@@ -90,25 +107,25 @@ async function connect() {
 
       if (code === DisconnectReason.loggedOut || code === 401) {
         connectionStatus = 'disconnected';
-        await updateSessionStatus('disconnected');
-        // امسح الـ auth للسماح بـ QR جديد
+        updateSessionStatus('disconnected').catch(() => {});
         if (fs.existsSync(AUTH_DIR)) {
           fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         }
-        console.log('[WhatsApp] Logged out. Auth cleared. Scan QR again.');
+        console.log('[WhatsApp] Logged out. Auth cleared. Will reconnect for new QR...');
+        setTimeout(connect, 3000);
         return;
       }
 
       if (shouldReconnect && reconnectAttempts < MAX_RECONNECT) {
         reconnectAttempts++;
         connectionStatus = 'connecting';
-        await updateSessionStatus('connecting');
-        const waitMs = Math.min(reconnectAttempts * 5000, 30000);
+        updateSessionStatus('connecting').catch(() => {});
+        const waitMs = Math.min(reconnectAttempts * 3000, 15000);
         console.log(`[WhatsApp] Reconnecting in ${waitMs / 1000}s (attempt ${reconnectAttempts})...`);
         setTimeout(connect, waitMs);
       } else {
         connectionStatus = 'disconnected';
-        await updateSessionStatus('disconnected');
+        updateSessionStatus('disconnected').catch(() => {});
       }
     }
   });
@@ -119,8 +136,6 @@ async function connect() {
 
 /**
  * إرسال رسالة نصية لجروب
- * @param {string} groupJid - معرف الجروب مثل 120363xxx@g.us
- * @param {string} text     - نص الرسالة
  */
 async function sendGroupMessage(groupJid, text) {
   if (!sock || connectionStatus !== 'connected') {
@@ -131,15 +146,11 @@ async function sendGroupMessage(groupJid, text) {
     throw new Error(`group_jid غير صحيح: ${groupJid} (يجب أن ينتهي بـ @g.us)`);
   }
 
-  // استخدام queue للـ rate limiting
   return enqueue(async () => {
-    // typing indicator للإيحاء بسلوك بشري
     try {
       await sock.sendPresenceUpdate('composing', groupJid);
       await delay(800 + Math.random() * 700);
-    } catch (_) {
-      // تجاهل لو الجروب ما عندوش هذه الخاصية
-    }
+    } catch (_) {}
 
     const result = await sock.sendMessage(groupJid, { text });
 
@@ -155,10 +166,7 @@ async function sendGroupMessage(groupJid, text) {
  * جلب قائمة الجروبات المشترك فيها
  */
 async function getGroups() {
-  if (!sock || connectionStatus !== 'connected') {
-    return [];
-  }
-
+  if (!sock || connectionStatus !== 'connected') return [];
   try {
     const groups = await sock.groupFetchAllParticipating();
     return Object.entries(groups).map(([jid, meta]) => ({
@@ -177,11 +185,12 @@ async function getGroups() {
  */
 async function disconnect() {
   if (sock) {
-    await sock.logout();
+    try { await sock.logout(); } catch (_) {}
     sock = null;
     connectionStatus = 'disconnected';
-    currentQr = null;
-    await updateSessionStatus('disconnected');
+    currentQrRaw = null;
+    currentQrBase64 = null;
+    updateSessionStatus('disconnected').catch(() => {});
   }
 }
 
@@ -191,21 +200,16 @@ async function disconnect() {
 function getStatus() {
   return {
     status: connectionStatus,
-    hasQr: currentQr !== null,
+    hasQr: currentQrBase64 !== null,
     reconnectAttempts,
   };
 }
 
 /**
- * QR Code الحالي كـ base64
+ * QR Code الحالي كـ base64 — محفوظ مسبقاً في الذاكرة
  */
-async function getCurrentQrBase64() {
-  if (!currentQr) return null;
-  try {
-    return await qrcode.toDataURL(currentQr, { width: 300 });
-  } catch {
-    return null;
-  }
+async function getQrBase64() {
+  return currentQrBase64;
 }
 
 module.exports = {
@@ -214,5 +218,5 @@ module.exports = {
   getGroups,
   disconnect,
   getStatus,
-  getCurrentQrBase64,
+  getCurrentQrBase64: getQrBase64,
 };
