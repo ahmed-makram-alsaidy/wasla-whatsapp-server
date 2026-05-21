@@ -65,7 +65,7 @@ app.get('/sessions', requireApiKey, (req, res) => {
 // ══════════════════════════════════════════════════════════
 
 // GET /company/:companyId/status
-app.get('/company/:companyId/status', requireApiKey, (req, res) => {
+app.get('/company/:companyId/status', (req, res) => {
   const { companyId } = req.params;
   res.json(wa.getStatus(companyId));
 });
@@ -165,7 +165,7 @@ app.get('/company/:companyId/qr-scan', (req, res) => {
 });
 
 // POST /company/:companyId/connect — بدء session
-app.post('/company/:companyId/connect', requireApiKey, async (req, res) => {
+app.post('/company/:companyId/connect', async (req, res) => {
   const { companyId } = req.params;
   log(`[${companyId}] Connect request`);
   try {
@@ -177,7 +177,7 @@ app.post('/company/:companyId/connect', requireApiKey, async (req, res) => {
 });
 
 // POST /company/:companyId/disconnect — قطع session
-app.post('/company/:companyId/disconnect', requireApiKey, async (req, res) => {
+app.post('/company/:companyId/disconnect', async (req, res) => {
   const { companyId } = req.params;
   log(`[${companyId}] Disconnect request`);
   try {
@@ -189,7 +189,7 @@ app.post('/company/:companyId/disconnect', requireApiKey, async (req, res) => {
 });
 
 // GET /company/:companyId/groups — جروبات الشركة
-app.get('/company/:companyId/groups', requireApiKey, async (req, res) => {
+app.get('/company/:companyId/groups', async (req, res) => {
   const { companyId } = req.params;
   try {
     const groups = await wa.getGroups(companyId);
