@@ -37,7 +37,7 @@ function log(msg) {
 
 /**
  * GET /health
- * فحص الـ server وحالة الاتصال
+ * فحص الـ server وحالة الاتصال — Public
  */
 app.get('/health', (req, res) => {
   const status = wa.getStatus();
@@ -52,35 +52,102 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * GET /status
- * حالة الاتصال بالتفصيل
+ * GET /status — Public
  */
-app.get('/status', requireApiKey, (req, res) => {
+app.get('/status', (req, res) => {
   res.json(wa.getStatus());
 });
 
 /**
- * GET /qr
- * الحصول على QR Code كـ base64 لعرضه في الواجهة
+ * GET /qr — Public (JSON)
+ * الحصول على QR Code كـ base64
  */
-app.get('/qr', requireApiKey, async (req, res) => {
+app.get('/qr', async (req, res) => {
   const { status } = wa.getStatus();
-
   if (status === 'connected') {
     return res.json({ connected: true, qr: null });
   }
-
   const qrBase64 = await wa.getCurrentQrBase64();
-
   if (!qrBase64) {
-    return res.json({
-      connected: false,
-      qr: null,
-      message: 'QR غير متاح بعد. انتظر 10 ثواني وحاول مجدداً.',
-    });
+    return res.json({ connected: false, qr: null, message: 'QR غير متاح بعد. انتظر 15 ثانية وحاول مجدداً.' });
   }
-
   res.json({ connected: false, qr: qrBase64 });
+});
+
+/**
+ * GET /qr-scan — Public (HTML Page)
+ * صفحة HTML لعرض QR وتتحدث كل 10 ثواني
+ */
+app.get('/qr-scan', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>واصلة — ربط واتساب</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 16px; padding: 40px; text-align: center; max-width: 400px; width: 90%; }
+    h1 { font-size: 22px; margin-bottom: 8px; color: #58a6ff; }
+    p { color: #8b949e; font-size: 14px; margin-bottom: 24px; }
+    #qr-img { width: 240px; height: 240px; border-radius: 12px; background: white; padding: 12px; margin: 0 auto 20px; display: block; }
+    .status { padding: 10px 20px; border-radius: 20px; font-size: 13px; display: inline-block; margin-bottom: 16px; }
+    .connecting { background: #1f2937; color: #f59e0b; border: 1px solid #f59e0b44; }
+    .connected { background: #1f2937; color: #22c55e; border: 1px solid #22c55e44; }
+    .waiting { background: #1f2937; color: #8b949e; border: 1px solid #30363d; }
+    .steps { text-align: right; font-size: 13px; color: #8b949e; line-height: 2; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>📱 ربط واتساب — واصلة إكسبريس</h1>
+    <p>امسح الـ QR من واتساب على هاتفك</p>
+    <div id="status-badge" class="status waiting">⏳ جاري التحميل...</div>
+    <br>
+    <img id="qr-img" src="" alt="QR Code" style="display:none"/>
+    <div id="msg" style="color:#8b949e;font-size:13px;margin:12px 0"></div>
+    <div class="steps">
+      <b style="color:#e6edf3">خطوات الربط:</b><br>
+      1️⃣ افتح واتساب على هاتفك<br>
+      2️⃣ اضغط ⋮ → الأجهزة المرتبطة<br>
+      3️⃣ اضغط "ربط جهاز"<br>
+      4️⃣ امسح الـ QR أعلاه
+    </div>
+  </div>
+  <script>
+    async function refresh() {
+      try {
+        const r = await fetch('/qr');
+        const d = await r.json();
+        const badge = document.getElementById('status-badge');
+        const img = document.getElementById('qr-img');
+        const msg = document.getElementById('msg');
+        if (d.connected) {
+          badge.className = 'status connected';
+          badge.textContent = '✅ متصل بنجاح!';
+          img.style.display = 'none';
+          msg.textContent = 'واتساب متصل. يمكنك إغلاق هذه الصفحة.';
+        } else if (d.qr) {
+          badge.className = 'status connecting';
+          badge.textContent = '📷 امسح الـ QR الآن';
+          img.src = d.qr;
+          img.style.display = 'block';
+          msg.textContent = 'الـ QR يتجدد كل 60 ثانية';
+        } else {
+          badge.className = 'status waiting';
+          badge.textContent = '⏳ جاري التوليد...';
+          img.style.display = 'none';
+          msg.textContent = d.message || '';
+        }
+      } catch(e) { console.error(e); }
+    }
+    refresh();
+    setInterval(refresh, 10000);
+  </script>
+</body>
+</html>`);
 });
 
 /**
