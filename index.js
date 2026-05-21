@@ -12,6 +12,15 @@ const { getStats } = require('./rateLimiter');
 const app = express();
 app.use(express.json());
 
+// ── CORS — اسمح لأي origin يكلم السيرفر ───────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.BAILEYS_API_KEY;
 
