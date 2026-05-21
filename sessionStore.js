@@ -1,19 +1,16 @@
 // ─────────────────────────────────────────────────────────
-// sessionStore.js — حفظ جلسة Baileys في Supabase
-// يضمن إن الـ session ما تنضيعش لو الـ server restart
+// sessionStore.js — Multi-Tenant Supabase Session Store
+// كل شركة (company_id) عندها record مستقل
 // ─────────────────────────────────────────────────────────
 const { createClient } = require('@supabase/supabase-js');
 
-const SESSION_NAME = process.env.SESSION_NAME || 'wasla_main';
-
-// Lazy initialization — السيرفر مش بيوقع لو الـ vars مش موجودة عند الـ startup
 let _supabase = null;
 function getSupabase() {
   if (!_supabase) {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_KEY;
     if (!url || !key) {
-      console.warn('[SessionStore] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — DB logging disabled');
+      console.warn('[SessionStore] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — DB disabled');
       return null;
     }
     _supabase = createClient(url, key);
@@ -21,65 +18,109 @@ function getSupabase() {
   return _supabase;
 }
 
-/**
- * تحديث حالة الـ session في Supabase
- */
-async function updateSessionStatus(status, extra = {}) {
+// ─────────────────────────────────────────────────────────
+// Per-Company Session Status
+// ─────────────────────────────────────────────────────────
+
+async function updateCompanySessionStatus(companyId, status, phoneNumber = null) {
   const db = getSupabase();
   if (!db) return;
   try {
     const { error } = await db
-      .from('whatsapp_baileys_sessions')
-      .update({ status, last_seen_at: new Date().toISOString(), ...extra })
-      .eq('session_name', SESSION_NAME);
-    if (error) console.error('[SessionStore] updateStatus error:', error.message);
+      .from('whatsapp_sessions')
+      .upsert({
+        company_id: companyId,
+        status,
+        phone_number: phoneNumber,
+        updated_at: new Date().toISOString(),
+        ...(status === 'connected' ? { connected_at: new Date().toISOString() } : {}),
+      }, { onConflict: 'company_id' });
+    if (error) console.error(`[SessionStore:${companyId}] updateStatus error:`, error.message);
   } catch (e) {
-    console.error('[SessionStore] updateStatus exception:', e.message);
+    console.error(`[SessionStore:${companyId}] updateStatus exception:`, e.message);
   }
 }
 
-/**
- * حفظ QR Code في DB لعرضه في الواجهة
- */
-async function saveQrCode(qrBase64) {
+async function saveCompanyQrCode(companyId, qrBase64) {
   const db = getSupabase();
   if (!db) return;
   try {
     const { error } = await db
-      .from('whatsapp_baileys_sessions')
-      .update({ qr_code: qrBase64, status: 'connecting', updated_at: new Date().toISOString() })
-      .eq('session_name', SESSION_NAME);
-    if (error) console.error('[SessionStore] saveQR error:', error.message);
+      .from('whatsapp_sessions')
+      .upsert({
+        company_id: companyId,
+        qr_code: qrBase64,
+        status: 'connecting',
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'company_id' });
+    if (error) console.error(`[SessionStore:${companyId}] saveQR error:`, error.message);
   } catch (e) {
-    console.error('[SessionStore] saveQR exception:', e.message);
+    console.error(`[SessionStore:${companyId}] saveQR exception:`, e.message);
   }
 }
 
-/**
- * مسح QR بعد الاتصال
- */
-async function clearQrCode(phoneNumber) {
+async function clearCompanyQrCode(companyId, phoneNumber) {
   const db = getSupabase();
   if (!db) return;
   try {
     const { error } = await db
-      .from('whatsapp_baileys_sessions')
-      .update({ qr_code: null, status: 'connected', phone_number: phoneNumber, last_seen_at: new Date().toISOString() })
-      .eq('session_name', SESSION_NAME);
-    if (error) console.error('[SessionStore] clearQR error:', error.message);
+      .from('whatsapp_sessions')
+      .upsert({
+        company_id: companyId,
+        qr_code: null,
+        status: 'connected',
+        phone_number: phoneNumber,
+        connected_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'company_id' });
+    if (error) console.error(`[SessionStore:${companyId}] clearQR error:`, error.message);
   } catch (e) {
-    console.error('[SessionStore] clearQR exception:', e.message);
+    console.error(`[SessionStore:${companyId}] clearQR exception:`, e.message);
   }
 }
 
-/**
- * تسجيل رسالة جروب في سجل الرسائل
- */
-async function logGroupMessage({ groupJid, groupName, merchantId, shipmentId, trackingNumber, messageText, status, errorText }) {
+// جلب حالة session شركة من Supabase
+async function getCompanySession(companyId) {
+  const db = getSupabase();
+  if (!db) return null;
+  try {
+    const { data, error } = await db
+      .from('whatsapp_sessions')
+      .select('*')
+      .eq('company_id', companyId)
+      .maybeSingle();
+    if (error) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// جلب كل الشركات التي عندها sessions نشطة
+async function getActiveCompanySessions() {
+  const db = getSupabase();
+  if (!db) return [];
+  try {
+    const { data, error } = await db
+      .from('whatsapp_sessions')
+      .select('company_id, status, phone_number')
+      .neq('status', 'disconnected');
+    if (error) return [];
+    return data || [];
+  } catch {
+    return [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// Message Logging
+// ─────────────────────────────────────────────────────────
+async function logGroupMessage({ companyId, groupJid, groupName, merchantId, shipmentId, trackingNumber, messageText, status, errorText }) {
   const db = getSupabase();
   if (!db) return;
   try {
     await db.from('whatsapp_group_message_log').insert({
+      company_id: companyId || null,
       group_jid: groupJid,
       group_name: groupName,
       merchant_id: merchantId || null,
@@ -95,9 +136,6 @@ async function logGroupMessage({ groupJid, groupName, merchantId, shipmentId, tr
   }
 }
 
-/**
- * تحديث حالة رسالة في notification_outbox
- */
 async function markOutboxMessage(outboxId, status, errorText = null) {
   const db = getSupabase();
   if (!db) return;
@@ -112,9 +150,11 @@ async function markOutboxMessage(outboxId, status, errorText = null) {
 }
 
 module.exports = {
-  updateSessionStatus,
-  saveQrCode,
-  clearQrCode,
+  updateCompanySessionStatus,
+  saveCompanyQrCode,
+  clearCompanyQrCode,
+  getCompanySession,
+  getActiveCompanySessions,
   logGroupMessage,
   markOutboxMessage,
 };
