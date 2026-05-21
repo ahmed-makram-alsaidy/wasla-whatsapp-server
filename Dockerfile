@@ -2,6 +2,7 @@ FROM node:20-bullseye-slim
 
 # System dependencies required by Baileys & native modules
 RUN apt-get update && apt-get install -y \
+    git \
     python3 \
     make \
     g++ \
