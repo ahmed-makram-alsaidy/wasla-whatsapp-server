@@ -76,17 +76,17 @@ app.get('/company/:companyId/qr', async (req, res) => {
   const status = wa.getStatus(companyId);
 
   if (status.status === 'connected') {
-    return res.json({ connected: true, qr: null, phoneNumber: status.phoneNumber });
+    return res.json({ connected: true, state: 'connected', status: 'connected', qr: null, qrCode: null, phoneNumber: status.phoneNumber });
   }
 
   const qrBase64 = wa.getQrBase64(companyId);
   if (!qrBase64) {
     return res.json({
-      connected: false, qr: null,
+      connected: false, state: status.status, status: status.status, qr: null, qrCode: null,
       message: 'QR غير متاح بعد. انتظر 15 ثانية وحاول مجدداً.',
     });
   }
-  res.json({ connected: false, qr: qrBase64 });
+  res.json({ connected: false, state: 'connecting', status: 'connecting', qr: qrBase64, qrCode: qrBase64 });
 });
 
 // GET /company/:companyId/qr-scan — صفحة HTML للمسح
@@ -257,9 +257,9 @@ const DEFAULT_COMPANY = process.env.PLATFORM_COMPANY_ID || 'platform';
 app.get('/status', (req, res) => res.json(wa.getStatus(DEFAULT_COMPANY)));
 app.get('/qr', async (req, res) => {
   const status = wa.getStatus(DEFAULT_COMPANY);
-  if (status.status === 'connected') return res.json({ connected: true, qr: null });
+  if (status.status === 'connected') return res.json({ connected: true, state: 'connected', status: 'connected', qr: null, qrCode: null, phoneNumber: status.phoneNumber });
   const qr = wa.getQrBase64(DEFAULT_COMPANY);
-  res.json({ connected: false, qr: qr || null });
+  res.json({ connected: false, state: qr ? 'connecting' : status.status, status: qr ? 'connecting' : status.status, qr: qr || null, qrCode: qr || null });
 });
 app.get('/qr-scan', (req, res) => res.redirect(`/company/${DEFAULT_COMPANY}/qr-scan`));
 app.get('/groups', requireApiKey, async (req, res) => {
