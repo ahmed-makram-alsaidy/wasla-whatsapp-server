@@ -189,6 +189,27 @@ app.post('/company/:companyId/disconnect', async (req, res) => {
 });
 
 // GET /company/:companyId/groups — جروبات الشركة
+app.post('/company/:companyId/pairing-code', requireApiKey, async (req, res) => {
+  const { companyId } = req.params;
+  const phoneNumber =
+    req.body.phone ||
+    req.body.phoneNumber ||
+    req.body.number ||
+    req.body.whatsapp_number ||
+    req.query.phone;
+
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'phone number is required' });
+  }
+
+  try {
+    const result = await wa.requestPairingCode(companyId, phoneNumber);
+    res.json({ ok: true, companyId, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get('/company/:companyId/groups', async (req, res) => {
   const { companyId } = req.params;
   try {
@@ -252,6 +273,34 @@ app.post('/company/:companyId/send-group', requireApiKey, async (req, res) => {
 // LEGACY ROUTES (backward compat — بدون companyId)
 // للـ Edge Functions القديمة — بيستخدموا PLATFORM_COMPANY_ID
 // ══════════════════════════════════════════════════════════
+app.post('/company/:companyId/send-message', requireApiKey, async (req, res) => {
+  const { companyId } = req.params;
+  const recipient =
+    req.body.to ||
+    req.body.phone ||
+    req.body.number ||
+    req.body.recipient_phone ||
+    req.body.recipient ||
+    req.body.whatsapp_number;
+  const message = req.body.message || req.body.text || req.body.body;
+
+  if (!recipient || !message) {
+    return res.status(400).json({ error: 'recipient and message are required' });
+  }
+
+  try {
+    const result = await wa.sendDirectMessage(companyId, recipient, message);
+    res.json({
+      ok: true,
+      companyId,
+      to: recipient,
+      messageId: result?.key?.id || null,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 const DEFAULT_COMPANY = process.env.PLATFORM_COMPANY_ID || 'platform';
 
 app.get('/status', (req, res) => res.json(wa.getStatus(DEFAULT_COMPANY)));
@@ -277,6 +326,31 @@ app.post('/send-group', requireApiKey, async (req, res) => {
     res.json({ ok: true, group_jid });
   } catch (err) {
     if (outbox_id) await markOutboxMessage(outbox_id, 'failed', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.post('/send-message', requireApiKey, async (req, res) => {
+  const recipient =
+    req.body.to ||
+    req.body.phone ||
+    req.body.number ||
+    req.body.recipient_phone ||
+    req.body.recipient ||
+    req.body.whatsapp_number;
+  const message = req.body.message || req.body.text || req.body.body;
+
+  if (!recipient || !message) {
+    return res.status(400).json({ error: 'recipient and message are required' });
+  }
+
+  try {
+    const result = await wa.sendDirectMessage(DEFAULT_COMPANY, recipient, message);
+    res.json({
+      ok: true,
+      to: recipient,
+      messageId: result?.key?.id || null,
+    });
+  } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });

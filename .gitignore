@@ -1,4 +1,5 @@
 auth_info_baileys/
+auth_sessions/
 node_modules/
 .env
 *.log
