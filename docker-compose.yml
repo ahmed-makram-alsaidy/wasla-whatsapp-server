@@ -1,0 +1,28 @@
+# wasla-whatsapp-server — single-instance production deployment
+#
+# SINGLE-INSTANCE LAW: exactly ONE replica of this service may run against a
+# given auth_sessions volume + Supabase project. Baileys session ownership is
+# a single-socket domain; do not scale this service horizontally.
+
+services:
+  wasla-whatsapp-server:
+    build: .
+    image: wasla-whatsapp-server:2.1.0
+    container_name: wasla-whatsapp-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - AUTH_SESSIONS_DIR=/app/auth_sessions
+    ports:
+      - "127.0.0.1:3000:3000"   # internal only — reverse proxy terminates TLS
+    volumes:
+      - /opt/wasla-whatsapp/auth_sessions:/app/auth_sessions
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 15s

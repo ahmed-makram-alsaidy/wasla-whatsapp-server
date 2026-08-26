@@ -1,6 +1,15 @@
 // ─────────────────────────────────────────────────────────
 // whatsapp.js — Multi-Session Baileys Manager
 // كل شركة (company_id) عندها session مستقلة
+//
+// Closure hardening:
+//  - AUTH_SESSIONS_DIR configurable; every company dir resolved and asserted
+//    to remain a child of the base dir (defense in depth behind UUID law).
+//  - Auth wipe ONLY on evidence of invalid credentials (loggedOut /
+//    badSession / multideviceMismatch / 401). Transient provider errors such
+//    as 500/411/timeouts are retried WITHOUT destroying valid sessions.
+//  - restoreActiveSessions runs sequentially with jitter (no connect storm).
+//  - graceful close for shutdown.
 // ─────────────────────────────────────────────────────────
 const {
   default: makeWASocket,
@@ -14,12 +23,16 @@ const pino = require('pino');
 const qrcode = require('qrcode');
 const path = require('path');
 const fs = require('fs');
+const { validateCompanyId } = require('./uuid');
 const { updateCompanySessionStatus, saveCompanyQrCode, clearCompanyQrCode, logGroupMessage, markOutboxMessage } = require('./sessionStore');
 const { enqueue } = require('./rateLimiter');
 
 const logger = pino({ level: 'silent' });
-const BASE_AUTH_DIR = path.join(__dirname, 'auth_sessions');
+const BASE_AUTH_DIR = process.env.AUTH_SESSIONS_DIR
+  ? path.resolve(process.env.AUTH_SESSIONS_DIR)
+  : path.join(__dirname, 'auth_sessions');
 const MAX_RECONNECT = 10;
+const RESTORE_JITTER_MS = parseInt(process.env.RESTORE_JITTER_MS || '1500', 10);
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -43,9 +56,18 @@ function getSessionState(companyId) {
 }
 
 function getAuthDir(companyId) {
-  const dir = path.join(BASE_AUTH_DIR, companyId);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return dir;
+  const id = validateCompanyId(companyId);
+  if (!id) {
+    throw new Error('invalid companyId: expected UUID');
+  }
+  const dir = path.join(BASE_AUTH_DIR, id);
+  const resolved = path.resolve(dir);
+  // Defense in depth: resolved dir must stay inside BASE_AUTH_DIR.
+  if (resolved !== BASE_AUTH_DIR && !resolved.startsWith(BASE_AUTH_DIR + path.sep)) {
+    throw new Error('invalid companyId: escaped auth root');
+  }
+  if (!fs.existsSync(resolved)) fs.mkdirSync(resolved, { recursive: true });
+  return resolved;
 }
 
 function normalizePhoneNumber(value) {
@@ -133,13 +155,13 @@ async function connect(companyId) {
       const code = lastDisconnect?.error?.output?.statusCode;
       const restartRequired = code === DisconnectReason.restartRequired;
       const qrTimedOut = code === DisconnectReason.timedOut && s.status === 'connecting';
+      // Wipe only on credential-invalidating evidence. Provider/transient
+      // failures (500/411/etc.) must NOT destroy a linked session.
       const resetSession =
         code === DisconnectReason.loggedOut ||
         code === DisconnectReason.badSession ||
         code === DisconnectReason.multideviceMismatch ||
-        code === 401 ||
-        code === 500 ||
-        code === 411;
+        code === 401;
 
       console.log(`[WA:${companyId}] Disconnected. Code: ${code}`);
 
@@ -279,6 +301,114 @@ async function getGroups(companyId) {
 }
 
 // ─────────────────────────────────────────────────────────
+// Group membership helpers (merchant add-to-group closure)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Returns metadata.participants array for a group owned by this session.
+ * Each entry: { id: 'phone@s.whatsapp.net', admin?: string|null, ... }
+ */
+async function getGroupParticipants(companyId, groupJid) {
+  const s = getSessionState(companyId);
+  if (!s.sock || s.status !== 'connected') {
+    throw new Error(`WhatsApp company ${companyId} is not connected.`);
+  }
+  assertGroupJid(groupJid);
+  const meta = await s.sock.groupMetadata(groupJid);
+  return (meta.participants || []).map(p => ({
+    id: p.id,
+    isAdmin: !!p.admin,
+  }));
+}
+
+function assertGroupJid(groupJid) {
+  const raw = String(groupJid || '').trim();
+  if (!/^\d+@g\.us$/.test(raw)) {
+    throw new Error(`group_jid غير صحيح: ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * Idempotently add one participant to a group via this company's session.
+ * Returns a truthful outcome instead of throwing for expected states.
+ */
+async function addGroupParticipant(companyId, groupJid, phone) {
+  const s = getSessionState(companyId);
+  if (!s.sock || s.status !== 'connected') {
+    throw new Error(`واتساب شركة ${companyId} غير متصل. من فضلك امسح الـ QR أولاً.`);
+  }
+
+  const jid = assertGroupJid(groupJid);
+  const digits = normalizePhoneNumber(phone);
+  const userJid = `${digits}@s.whatsapp.net`;
+
+  // Already a participant? → idempotent success without touching WhatsApp.
+  try {
+    const participants = await getGroupParticipants(companyId, jid);
+    if (participants.some(p => p.id === userJid)) {
+      return { ok: true, result: 'already_participant', userJid, groupJid: jid };
+    }
+  } catch (e) {
+    // Metadata failure must not be hidden as "added".
+    return {
+      ok: false,
+      result: 'metadata_unavailable',
+      error: e.message,
+      userJid,
+      groupJid: jid,
+    };
+  }
+
+  try {
+    const res = await s.sock.groupParticipantsUpdate(jid, [userJid], 'add');
+    const first = Array.isArray(res) ? res[0] : null;
+    // Baileys returns per-participant status objects:
+    // { key: { user }, status: '200' | '403' | '408' | '409' | ... , message? }
+    const status = String(first?.status ?? '');
+
+    if (status === '200') {
+      return { ok: true, result: 'added', userJid, groupJid: jid };
+    }
+    if (status === '302' || status === '409' || status === '500') {
+      // 302: participant privacy requires invite; treat as pending invite sent
+      // 409: conflict / already in group per server view
+      // 500: server accepted but not confirmed
+      return {
+        ok: false,
+        result: status === '409' ? 'already_participant' : 'invite_pending',
+        baileysStatus: status,
+        message: first?.message?.attrs?.add_reason || first?.message || null,
+        userJid,
+        groupJid: jid,
+      };
+    }
+    if (status === '403') {
+      // Bot lacks admin rights or blocked — actionable for staff UI.
+      return {
+        ok: false,
+        result: 'bot_not_admin_or_blocked',
+        baileysStatus: status,
+        message: typeof first?.message === 'string'
+          ? first.message
+          : (first?.message?.attrs?.add_reason || null),
+        userJid,
+        groupJid: jid,
+      };
+    }
+    if (status === '404') {
+      return { ok: false, result: 'phone_not_on_whatsapp', baileysStatus: status, userJid, groupJid: jid };
+    }
+    if (status === '408') {
+      return { ok: false, result: 'invite_sent_awaiting_accept', baileysStatus: status, userJid, groupJid: jid };
+    }
+    return { ok: false, result: 'unknown_status', baileysStatus: status || null, userJid, groupJid: jid };
+  } catch (e) {
+    return { ok: false, result: 'error', error: e.message, userJid, groupJid: jid };
+  }
+}
+
+// ─────────────────────────────────────────────────────────
 // sendGroupMessage — إرسال رسالة من session شركة معينة
 // ─────────────────────────────────────────────────────────
 async function sendGroupMessage(companyId, groupJid, text) {
@@ -288,20 +418,18 @@ async function sendGroupMessage(companyId, groupJid, text) {
     throw new Error(`واتساب شركة ${companyId} غير متصل. من فضلك امسح الـ QR أولاً.`);
   }
 
-  if (!groupJid.endsWith('@g.us')) {
-    throw new Error(`group_jid غير صحيح: ${groupJid}`);
-  }
+  const jid = assertGroupJid(groupJid);
 
-  return enqueue(async () => {
+  return enqueue(companyId, async () => {
     try {
-      await s.sock.sendPresenceUpdate('composing', groupJid);
+      await s.sock.sendPresenceUpdate('composing', jid);
       await delay(800 + Math.random() * 700);
     } catch (_) {}
 
-    const result = await s.sock.sendMessage(groupJid, { text });
+    const result = await s.sock.sendMessage(jid, { text });
 
     try {
-      await s.sock.sendPresenceUpdate('paused', groupJid);
+      await s.sock.sendPresenceUpdate('paused', jid);
     } catch (_) {}
 
     return result;
@@ -337,7 +465,7 @@ async function sendDirectMessage(companyId, recipient, text) {
 
   const jid = normalizeDirectJid(recipient);
 
-  return enqueue(async () => {
+  return enqueue(companyId, async () => {
     try {
       await s.sock.sendPresenceUpdate('composing', jid);
       await delay(500 + Math.random() * 500);
@@ -363,17 +491,42 @@ function getAllSessionsStatus() {
 
 // ─────────────────────────────────────────────────────────
 // restoreActiveSessions — استعادة sessions محفوظة عند بدء السيرفر
+// Sequential + jitter to avoid a connection storm on boot.
 // ─────────────────────────────────────────────────────────
 async function restoreActiveSessions() {
   if (!fs.existsSync(BASE_AUTH_DIR)) return;
   const companies = fs.readdirSync(BASE_AUTH_DIR);
-  console.log(`[WA] Restoring ${companies.length} sessions...`);
+  console.log(`[WA] Restoring ${companies.length} sessions sequentially...`);
+  let restored = 0;
   for (const companyId of companies) {
     const authDir = path.join(BASE_AUTH_DIR, companyId);
     if (fs.statSync(authDir).isDirectory()) {
       console.log(`[WA] Restoring session for: ${companyId}`);
-      connect(companyId).catch(e => console.error(`[WA:${companyId}] Restore error:`, e.message));
+      try {
+        await connect(companyId);
+        restored++;
+      } catch (e) {
+        console.error(`[WA:${companyId}] Restore error:`, e.message);
+      }
+      const jitter = Math.floor(Math.random() * RESTORE_JITTER_MS);
+      await sleep(jitter);
     }
+  }
+  console.log(`[WA] Restore complete: ${restored}/${companies.length}`);
+}
+
+// ─────────────────────────────────────────────────────────
+// gracefulCloseAll — stop sending, end sockets without logout.
+// Preserves auth material so restart re-links silently.
+// ─────────────────────────────────────────────────────────
+async function gracefulCloseAll() {
+  for (const [, s] of sessions) {
+    if (s.sock) {
+      try { s.sock.ev.removeAllListeners('connection.update'); } catch (_) {}
+      try { s.sock.end(undefined); } catch (_) {}
+      s.sock = null;
+    }
+    s.status = 'disconnected';
   }
 }
 
@@ -384,10 +537,15 @@ module.exports = {
   getStatus,
   getQrBase64,
   getGroups,
+  getGroupParticipants,
+  addGroupParticipant,
   sendGroupMessage,
   sendDirectMessage,
   getAllSessionsStatus,
   restoreActiveSessions,
+  gracefulCloseAll,
+  validateCompanyId,
+  BASE_AUTH_DIR,
   // Legacy exports (single session → default company)
   logGroupMessage,
   markOutboxMessage,

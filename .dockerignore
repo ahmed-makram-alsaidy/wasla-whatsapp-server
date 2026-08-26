@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+auth_sessions/
+auth_info_baileys/
+node_modules/
+*.log
+npm-debug.log*
+Dockerfile
+docker-compose.yml
+.dockerignore
+deploy/
+test/
+tests/
+README.md
