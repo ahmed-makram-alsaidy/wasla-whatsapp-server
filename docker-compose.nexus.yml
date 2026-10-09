@@ -1,0 +1,38 @@
+# Dedicated WhatsApp gateway alongside TEMM Nexus.
+# This file does NOT configure public DNS or Caddy HTTPS.
+# IMPORTANT: no shared sessions with any other running Baileys replica.
+# Requires an operator-provisioned private .env file and auth_sessions bind mount.
+name: wasla-whatsapp-nexus
+
+services:
+  gateway:
+    image: ${WASLA_WHATSAPP_IMAGE:-wasla-whatsapp-server:nexus-staging-20261009}
+    container_name: wasla-whatsapp-nexus
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      NODE_ENV: production
+      AUTH_SESSIONS_DIR: /app/auth_sessions
+    ports:
+      - "127.0.0.1:${WASLA_WHATSAPP_HOST_PORT:-3300}:3000"
+    volumes:
+      - ./auth_sessions:/app/auth_sessions
+    networks:
+      - default
+      - nexus_proxy
+    mem_limit: 512m
+    cpus: 0.5
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 20s
+
+networks:
+  nexus_proxy:
+    external: true
+    name: ${NEXUS_PROXY_NETWORK:-backend-plane_proxy}
